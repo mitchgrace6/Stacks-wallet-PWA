@@ -64,3 +64,94 @@
 (define-data-var next-wallet-id uint u1)
 (define-data-var next-tx-id uint u1)
 (define-data-var contract-paused bool false)
+
+;; private functions
+(define-private (is-contract-owner)
+  (is-eq tx-sender CONTRACT-OWNER)
+)
+
+(define-private (is-wallet-signer (wallet-id uint) (user principal))
+  (match (map-get? wallet-permissions { wallet-id: wallet-id, signer: user })
+    permission (get is-active permission)
+    false
+  )
+)
+
+(define-private (get-wallet-info (wallet-id uint))
+  (map-get? wallets { wallet-id: wallet-id })
+)
+
+(define-private (is-wallet-frozen (wallet-id uint))
+  (match (get-wallet-info wallet-id)
+    wallet (get is-frozen wallet)
+    true
+  )
+)
+
+(define-private (update-daily-spending (wallet-id uint) (amount uint))
+  (match (get-wallet-info wallet-id)
+    wallet 
+      (let 
+        (
+          (current-block block-height)
+          (last-reset (get last-reset-block wallet))
+          (daily-spent (get daily-spent wallet))
+          (daily-limit (get daily-limit wallet))
+          (blocks-since-reset (- current-block last-reset))
+        )
+        (if (>= blocks-since-reset u144) ;; Reset daily limit every ~24 hours
+          (begin
+            (map-set wallets 
+              { wallet-id: wallet-id }
+              (merge wallet { 
+                daily-spent: amount, 
+                last-reset-block: current-block 
+              })
+            )
+            true
+          )
+          (if (<= (+ daily-spent amount) daily-limit)
+            (begin
+              (map-set wallets 
+                { wallet-id: wallet-id }
+                (merge wallet { daily-spent: (+ daily-spent amount) })
+              )
+              true
+            )
+            false
+          )
+        )
+      )
+    false
+  )
+)
+
+(define-private (add-signature-to-tx (tx-id uint) (signer principal))
+  (match (map-get? pending-transactions { tx-id: tx-id })
+    tx-data
+      (let ((current-signatures (get signatures tx-data)))
+        (if (is-none (index-of current-signatures signer))
+          (map-set pending-transactions 
+            { tx-id: tx-id }
+            (merge tx-data { 
+              signatures: (unwrap! (as-max-len? (append current-signatures signer) u10) false)
+            })
+          )
+          false
+        )
+      )
+    false
+  )
+)
+
+(define-private (has-sufficient-signatures (wallet-id uint) (tx-id uint))
+  (match (get-wallet-info wallet-id)
+    wallet
+      (match (map-get? pending-transactions { tx-id: tx-id })
+        tx-data
+          (>= (len (get signatures tx-data)) (get threshold wallet))
+        false
+      )
+    false
+  )
+)
