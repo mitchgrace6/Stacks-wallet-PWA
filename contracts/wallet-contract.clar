@@ -252,3 +252,142 @@
     (ok amount)
   )
 )
+
+;; Create a pending transaction
+(define-public (create-transaction 
+  (wallet-id uint)
+  (recipient principal)
+  (amount uint)
+  (memo (optional (string-ascii 200)))
+)
+  (let 
+    (
+      (tx-id (var-get next-tx-id))
+      (wallet-info (unwrap! (get-wallet-info wallet-id) ERR-NOT-FOUND))
+    )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-wallet-frozen wallet-id)) ERR-WALLET-FROZEN)
+    (asserts! (is-wallet-signer wallet-id tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= amount (get balance wallet-info)) ERR-INSUFFICIENT-BALANCE)
+    
+    ;; Create pending transaction
+    (map-set pending-transactions
+      { tx-id: tx-id }
+      {
+        wallet-id: wallet-id,
+        recipient: recipient,
+        amount: amount,
+        memo: memo,
+        signatures: (list tx-sender),
+        created-at: block-height,
+        expires-at: (+ block-height TRANSACTION-EXPIRY-BLOCKS),
+        is-executed: false
+      }
+    )
+    
+    ;; Increment transaction ID
+    (var-set next-tx-id (+ tx-id u1))
+    
+    (ok tx-id)
+  )
+)
+
+;; Sign a pending transaction
+(define-public (sign-transaction (tx-id uint))
+  (let ((tx-data (unwrap! (map-get? pending-transactions { tx-id: tx-id }) ERR-NOT-FOUND)))
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get is-executed tx-data)) ERR-NOT-FOUND)
+    (asserts! (< block-height (get expires-at tx-data)) ERR-TRANSACTION-EXPIRED)
+    (asserts! (is-wallet-signer (get wallet-id tx-data) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none (index-of (get signatures tx-data) tx-sender)) ERR-ALREADY-SIGNED)
+    
+    ;; Add signature
+    (asserts! (add-signature-to-tx tx-id tx-sender) ERR-NOT-AUTHORIZED)
+    
+    (ok true)
+  )
+)
+
+;; Execute a transaction with sufficient signatures
+(define-public (execute-transaction (tx-id uint))
+  (let 
+    (
+      (tx-data (unwrap! (map-get? pending-transactions { tx-id: tx-id }) ERR-NOT-FOUND))
+      (wallet-id (get wallet-id tx-data))
+      (wallet-info (unwrap! (get-wallet-info wallet-id) ERR-NOT-FOUND))
+    )
+    (asserts! (not (var-get contract-paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (is-wallet-frozen wallet-id)) ERR-WALLET-FROZEN)
+    (asserts! (not (get is-executed tx-data)) ERR-NOT-FOUND)
+    (asserts! (< block-height (get expires-at tx-data)) ERR-TRANSACTION-EXPIRED)
+    (asserts! (has-sufficient-signatures wallet-id tx-id) ERR-INSUFFICIENT-SIGNATURES)
+    (asserts! (update-daily-spending wallet-id (get amount tx-data)) ERR-DAILY-LIMIT-EXCEEDED)
+    
+    ;; Execute transfer
+    (try! (as-contract (stx-transfer? (get amount tx-data) tx-sender (get recipient tx-data))))
+    
+    ;; Update wallet balance
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet-info { balance: (- (get balance wallet-info) (get amount tx-data)) })
+    )
+    
+    ;; Mark transaction as executed
+    (map-set pending-transactions
+      { tx-id: tx-id }
+      (merge tx-data { is-executed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Freeze/unfreeze wallet (owner only)
+(define-public (set-wallet-frozen (wallet-id uint) (frozen bool))
+  (let ((wallet-info (unwrap! (get-wallet-info wallet-id) ERR-NOT-FOUND)))
+    (asserts! (is-contract-owner) ERR-OWNER-ONLY)
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet-info { is-frozen: frozen })
+    )
+    
+    (ok frozen)
+  )
+)
+
+;; Emergency pause contract (owner only)
+(define-public (set-contract-paused (paused bool))
+  (begin
+    (asserts! (is-contract-owner) ERR-OWNER-ONLY)
+    (var-set contract-paused paused)
+    (ok paused)
+  )
+)
+
+;; Read-only functions
+(define-read-only (get-wallet-details (wallet-id uint))
+  (map-get? wallets { wallet-id: wallet-id })
+)
+
+(define-read-only (get-transaction-details (tx-id uint))
+  (map-get? pending-transactions { tx-id: tx-id })
+)
+
+(define-read-only (get-user-wallets (user principal))
+  (default-to { wallet-ids: (list) } (map-get? user-wallets { user: user }))
+)
+
+(define-read-only (is-authorized-signer (wallet-id uint) (user principal))
+  (is-wallet-signer wallet-id user)
+)
+
+(define-read-only (get-contract-info)
+  {
+    next-wallet-id: (var-get next-wallet-id),
+    next-tx-id: (var-get next-tx-id),
+    contract-paused: (var-get contract-paused),
+    contract-owner: CONTRACT-OWNER
+  }
+)
